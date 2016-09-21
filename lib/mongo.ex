@@ -82,13 +82,17 @@ defmodule Mongo do
     ] |> filter_nils
 
     cursor? = pool.version >= 1 and Keyword.get(opts, :use_cursor, true)
-    opts = Keyword.drop(opts, ~w(allow_disk_use max_time use_cursor)a)
+    cmd = case Keyword.get(opts, :database) do
+      nil -> "$cmd"
+      database -> database <> ".$cmd"
+    end
+    opts = Keyword.drop(opts, ~w(allow_disk_use max_time use_cursor database)a)
 
     if cursor? do
       query = query ++ [cursor: filter_nils(%{batchSize: opts[:batch_size]})]
-      aggregation_cursor(pool, "$cmd", query, nil, opts)
+      aggregation_cursor(pool, cmd, query, nil, opts)
     else
-      singly_cursor(pool, "$cmd", query, nil, opts)
+      singly_cursor(pool, cmd, query, nil, opts)
     end
   end
 
