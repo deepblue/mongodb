@@ -3,6 +3,10 @@ defmodule BSON.Binary do
   Represents BSON binary type
   """
 
+  @type t :: %__MODULE__{
+    binary: binary,
+    subtype: :generic | :function | :binary_old | :uuid_old | :uuid | :md5 | 0x80..0xFF
+  }
   defstruct [binary: nil, subtype: :generic]
 
   defimpl Inspect do
@@ -21,6 +25,8 @@ defmodule BSON.ObjectId do
   Represents BSON ObjectId type
   """
   defstruct [:value]
+
+  @type t :: %__MODULE__{value: <<_::96>>}
 
   @doc """
   Creates a new ObjectId from the consisting parts
@@ -59,7 +65,7 @@ defmodule BSON.ObjectId do
   """
   def encode!(%BSON.ObjectId{value: value}), do: do_encode(value)
 
-  def do_encode(<< l0::4, h0::4, l1::4, h1::4,  l2::4,  h2::4,  l3::4,  h3::4,
+  defp do_encode(<< l0::4, h0::4, l1::4, h1::4,  l2::4,  h2::4,  l3::4,  h3::4,
                    l4::4, h4::4, l5::4, h5::4,  l6::4,  h6::4,  l7::4,  h7::4,
                    l8::4, h8::4, l9::4, h9::4, l10::4, h10::4, l11::4, h11::4 >>) do
     << e(l0), e(h0), e(l1), e(h1), e(l2),  e(h2),  e(l3),  e(h3),
@@ -104,6 +110,7 @@ defmodule BSON.DateTime do
   Represents BSON DateTime type
   """
 
+  @type t :: %__MODULE__{utc: integer()}
   defstruct [:utc]
 
   @epoch :calendar.datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}})
@@ -161,6 +168,7 @@ defmodule BSON.Regex do
   Represents BSON Regex type
   """
 
+  @type t :: %__MODULE__{pattern: binary, options: binary}
   defstruct [:pattern, :options]
 
   defimpl Inspect do
@@ -179,6 +187,7 @@ defmodule BSON.JavaScript do
   Represents BSON JavaScript (with and without scope) types
   """
 
+  @type t :: %__MODULE__{code: binary, scope: %{binary => BSON.t}}
   defstruct [:code, :scope]
 
   defimpl Inspect do
@@ -197,6 +206,7 @@ defmodule BSON.Timestamp do
   Represents BSON Timestamp type
   """
 
+  @type t :: %__MODULE__{value: integer}
   defstruct [:value]
 
   defimpl Inspect do

@@ -1,190 +1,278 @@
 defmodule Mongo.Protocol do
-  @moduledoc false
+  use DBConnection
+  use Mongo.Messages
+  alias Mongo.Protocol.Utils
 
-  import Record
-  import Mongo.BinaryUtils
-  alias BSON.Encoder
-  alias BSON.Decoder
+  @timeout 5000
+  @find_flags ~w(tailable_cursor slave_ok no_cursor_timeout await_data exhaust allow_partial_results)a
+  @find_one_flags ~w(slave_ok exhaust partial)a
+  @insert_flags ~w(continue_on_error)a
+  @update_flags ~w(upsert)a
+  @write_concern ~w(w j wtimeout)a
 
-  @op_reply            1
-  @op_update        2001
-  @op_insert        2002
-  @op_query         2004
-  @op_get_more      2005
-  @op_delete        2006
-  @op_kill_cursors  2007
+  def connect(opts) do
+    {write_concern, opts} = Keyword.split(opts, @write_concern)
+    write_concern = Keyword.put_new(write_concern, :w, 1)
 
-  @update_flags [
-    upsert: 0x1,
-    multi:  0x2
-  ]
+    s = %{socket: nil,
+          request_id: 0,
+          timeout: opts[:timeout] || @timeout,
+          database: Keyword.fetch!(opts, :database),
+          write_concern: Map.new(write_concern),
+          wire_version: nil,
+          ssl: opts[:ssl] || false}
 
-  @insert_flags [
-    continue_on_error: 0x1
-  ]
-
-  @query_flags [
-    tailable_cursor:   0x2,
-    slave_ok:          0x4,
-    oplog_replay:      0x8,
-    no_cursor_timeout: 0x10,
-    await_data:        0x20,
-    exhaust:           0x40,
-    partial:           0x80
-  ]
-
-  @delete_flags [
-    single: 0x1
-  ]
-
-  @reply_flags [
-    cursor_not_found:   0x1,
-    query_failure:      0x2,
-    shard_config_stale: 0x4,
-    await_capable:      0x8
-  ]
-
-  @header_size 4 * 4
-
-  defrecordp :msg_header, [:length, :request_id, :response_to, :op_code]
-  defrecord  :op_update, [:coll, :flags, :query, :update]
-  defrecord  :op_insert, [:flags, :coll, :docs]
-  defrecord  :op_query, [:flags, :coll, :num_skip, :num_return, :query, :select]
-  defrecord  :op_get_more, [:coll, :num_return, :cursor_id]
-  defrecord  :op_delete, [:coll, :flags, :query]
-  defrecord  :op_kill_cursors, [:cursor_ids]
-  defrecord  :op_reply, [:flags, :cursor_id, :from, :num, :docs]
-
-  def encode(request_id, op) do
-    iodata = encode_op(op)
-    header = msg_header(length: IO.iodata_length(iodata) + @header_size,
-                        request_id: request_id, response_to: 0,
-                        op_code: op_to_code(op))
-
-    [encode_header(header)|iodata]
+    connect(opts, s)
   end
 
-  def decode_message(msg_header(length: length) = header, iolist)
-  when is_list(iolist) do
-    if IO.iodata_length(iolist) >= length,
-      do: decode_message(header, IO.iodata_to_binary(iolist)),
-    else: :error
-  end
-  def decode_message(msg_header(length: length, response_to: response_to), binary)
-  when byte_size(binary) >= length do
-    <<reply::binary(length), rest::binary>> = binary
-    {:ok, response_to, decode_reply(reply), rest}
-  end
-  def decode_message(_header, _binary) do
-    :error
+  defp connect(opts, s) do
+    # TODO: with/else in elixir 1.3
+    result =
+      with {:ok, s} <- tcp_connect(opts, s),
+           {:ok, s} <- maybe_ssl(opts, s),
+           {:ok, s} <- wire_version(s),
+           {:ok, s} <- Mongo.Auth.run(opts, s) do
+        {mod, sock} = s.socket
+        :ok = setopts(mod, sock, active: :once)
+        Mongo.Monitor.add_conn(self(), opts[:name], s.wire_version)
+        {:ok, s}
+      end
+
+    case result do
+      {:ok, s} ->
+        {:ok, s}
+      {:disconnect, {:tcp_recv, reason}, _s} ->
+        {:error, Mongo.Error.exception(tag: :tcp, action: "recv", reason: reason)}
+      {:disconnect, {:tcp_send, reason}, _s} ->
+        {:error, Mongo.Error.exception(tag: :tcp, action: "send", reason: reason)}
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
-  def decode_header(iolist) when is_list(iolist) do
-    if IO.iodata_length(iolist) >= @header_size,
-      do: IO.iodata_to_binary(iolist) |> decode_header,
-    else: :error
+  defp maybe_ssl(opts, s) do
+    if s.ssl do
+      ssl(s, opts)
+    else
+      {:ok, s}
+    end
   end
-  def decode_header(<<length::int32, request_id::int32, response_to::int32,
-                       op_code::int32, rest::binary>>) do
-    header = msg_header(length: length-@header_size, request_id: request_id,
-                        response_to: response_to, op_code: op_code)
-    {:ok, header, rest}
-  end
-  def decode_header(_binary) do
-    :error
-  end
-
-  defp encode_op(op_update(coll: coll, flags: flags, query: query, update: update)) do
-    [<<0x00::int32>>, coll, <<0x00, blit_flags(:update, flags)::int32>>,
-     Encoder.document(query), Encoder.document(update)]
+  defp ssl(%{socket: {:gen_tcp, sock}} = s, opts) do
+    case :ssl.connect(sock, opts[:ssl_opts] || [], 5000) do
+      {:ok, ssl_sock} ->
+        {:ok, %{s | socket: {:ssl, ssl_sock}}}
+      {:error, reason} ->
+        {:error, Mongo.Error.exception(tag: :ssl, action: "connect", reason: reason)}
+    end
   end
 
-  defp encode_op(op_insert(flags: flags, coll: coll, docs: docs)) do
-    [<<blit_flags(:insert, flags)::int32>>, coll, 0x00 |
-     Enum.map(docs, &Encoder.document/1)]
+  defp tcp_connect(opts, s) do
+    host      = (opts[:hostname] || "localhost") |> to_char_list
+    port      = opts[:port] || 27017
+    sock_opts = [:binary, active: false, packet: :raw, send_timeout: s.timeout, nodelay: true]
+                ++ (opts[:socket_options] || [])
+
+    case :gen_tcp.connect(host, port, sock_opts, s.timeout) do
+      {:ok, socket} ->
+        # A suitable :buffer is only set if :recbuf is included in
+        # :socket_options.
+        {:ok, [sndbuf: sndbuf, recbuf: recbuf, buffer: buffer]} =
+          :inet.getopts(socket, [:sndbuf, :recbuf, :buffer])
+        buffer = buffer |> max(sndbuf) |> max(recbuf)
+        :ok = :inet.setopts(socket, buffer: buffer)
+
+        {:ok, %{s | socket: {:gen_tcp, socket}}}
+
+      {:error, reason} ->
+        {:error, Mongo.Error.exception(tag: :tcp, action: "connect", reason: reason)}
+    end
   end
 
-  defp encode_op(op_query(flags: flags, coll: coll, num_skip: num_skip,
-                          num_return: num_return, query: query, select: select)) do
-    [<<blit_flags(:query, flags)::int32>>, coll, <<0x00, num_skip::int32,
-       num_return::int32>>, Encoder.document(query) |
-     maybe(select, &Encoder.document/1)]
+  defp wire_version(s) do
+    # wire version
+    # https://github.com/mongodb/mongo/blob/master/src/mongo/db/wire_version.h
+    case Utils.command(-1, [ismaster: 1], s) do
+      {:ok, %{"ok" => 1.0, "maxWireVersion" => version}} ->
+        {:ok, %{s | wire_version: version}}
+      {:ok, %{"ok" => 1.0}} ->
+        {:ok, %{s | wire_version: 0}}
+      {:disconnect, _, _} = error ->
+        error
+    end
   end
 
-  defp encode_op(op_get_more(coll: coll, num_return: num_return, cursor_id: cursor_id)) do
-    [<<0x00::int32>>, coll | <<0x00, num_return::int32, cursor_id::int64>>]
+  def handle_info({:tcp, data}, s) do
+    err = Mongo.Error.exception(message: "unexpected async recv: #{inspect data}")
+    {:disconnect, err, s}
   end
 
-  defp encode_op(op_delete(coll: coll, flags: flags, query: query)) do
-    [<<0x00::int32>>, coll, <<0x00, blit_flags(:delete, flags)::int32>> |
-     Encoder.document(query)]
+  def handle_info({:tcp_closed, _}, s) do
+    err = Mongo.Error.exception(tag: :tcp, action: "async recv", reason: :closed)
+    {:disconnect, err, s}
   end
 
-  defp encode_op(op_kill_cursors(cursor_ids: ids)) do
-    binary_ids = for id <- ids, into: "", do: <<id::int64>>
-    num = div byte_size(binary_ids), 8
-    [<<0x00::int32, num::int32>> | binary_ids]
+  def handle_info({:tcp_error, _, reason}, s) do
+    err = Mongo.Error.exception(tag: :tcp, action: "async recv", reason: reason)
+    {:disconnect, err, s}
   end
 
-  defp op_to_code(op_update()),       do: @op_update
-  defp op_to_code(op_insert()),       do: @op_insert
-  defp op_to_code(op_query()),        do: @op_query
-  defp op_to_code(op_get_more()),     do: @op_get_more
-  defp op_to_code(op_delete()),       do: @op_delete
-  defp op_to_code(op_kill_cursors()), do: @op_kill_cursors
-
-  defp decode_reply(<<flags::int32, cursor_id::int64, from::int32, num::int32, rest::binary>>) do
-    flags = unblit_flags(flags)
-    docs = decode_documents(rest, [])
-    op_reply(flags: flags, cursor_id: cursor_id, from: from, num: num, docs: docs)
+  def checkout(%{socket: {mod, sock}} = s) do
+    case setopts(mod, sock, [active: :false]) do
+      :ok                       -> recv_buffer(s)
+      {:disconnect, _, _} = dis -> dis
+    end
   end
 
-  defp encode_header(msg_header(length: length, request_id: request_id,
-                                response_to: response_to, op_code: op_code)) do
-    <<length::int32, request_id::int32, response_to::int32, op_code::int32>>
+  defp recv_buffer(%{socket: {:gen_tcp, sock}} = s) do
+    receive do
+      {:tcp, ^sock, _buffer} ->
+        {:ok, s}
+    after
+      0 ->
+        :inet.setopts(sock, buffer: <<>>)
+        {:ok, s}
+    end
+  end
+  defp recv_buffer(%{socket: {:ssl, sock}} = s) do
+    receive do
+      {:ssl, ^sock, _buffer} ->
+        {:ok, s}
+    after
+      0 ->
+        :ssl.setopts(sock, buffer: <<>>)
+        {:ok, s}
+    end
   end
 
-  defp decode_documents("", acc) do
-    Enum.reverse(acc)
+  def checkin(%{socket: {mod, sock}} = s) do
+    :ok = setopts(mod, sock, [active: :once])
+    {:ok, s}
   end
 
-  defp decode_documents(binary, acc) do
-    {doc, rest} = Decoder.document(binary)
-    decode_documents(rest, [doc|acc])
+  def handle_execute_close(query, params, opts, s) do
+    handle_execute(query, params, opts, s)
   end
 
-  defp blit_flags(op, flags) do
-    import Bitwise
-    Enum.reduce(flags, 0x0, &(flag_to_bit(op, &1) ||| &2))
+  def handle_execute(%Mongo.Query{action: action, extra: extra}, params, opts, s) do
+    handle_execute(action, extra, params, opts, s)
   end
 
-  defp unblit_flags(bits) do
-    import Bitwise
-    Enum.reduce(@reply_flags, [], fn {flag, bit}, acc ->
-      if (bit &&& bits) == 0,
-          do: acc,
-        else: [flag|acc]
+  defp handle_execute(:find, coll, [query, select], opts, s) do
+    flags      = Keyword.take(opts, @find_flags)
+    num_skip   = Keyword.get(opts, :skip, 0)
+    num_return = Keyword.get(opts, :batch_size, 0)
+
+    op_query(coll: Utils.namespace(coll, s), query: query, select: select,
+             num_skip: num_skip, num_return: num_return, flags: flags(flags))
+    |> message_reply(s)
+  end
+
+  defp handle_execute(:get_more, {coll, cursor_id}, [], opts, s) do
+    num_return = Keyword.get(opts, :batch_size, 0)
+
+    op_get_more(coll: Utils.namespace(coll, s), cursor_id: cursor_id,
+                num_return: num_return)
+    |> message_reply(s)
+  end
+
+  defp handle_execute(:kill_cursors, cursor_ids, [], _opts, s) do
+    op = op_kill_cursors(cursor_ids: cursor_ids)
+    with :ok <- Utils.send(-10, op, s),
+         do: {:ok, :ok, s}
+  end
+
+  defp handle_execute(:insert_one, coll, [doc], opts, s) do
+    flags  = flags(Keyword.take(opts, @insert_flags))
+    op     = op_insert(coll: Utils.namespace(coll, s), docs: [doc], flags: flags)
+    message_gle(-11, op, opts, s)
+  end
+
+  defp handle_execute(:insert_many, coll, docs, opts, s) do
+    flags  = flags(Keyword.take(opts, @insert_flags))
+    op     = op_insert(coll: Utils.namespace(coll, s), docs: docs, flags: flags)
+    message_gle(-12, op, opts, s)
+  end
+
+  defp handle_execute(:delete_one, coll, [query], opts, s) do
+    flags = [:single]
+    op    = op_delete(coll: Utils.namespace(coll, s), query: query, flags: flags)
+    message_gle(-13, op, opts, s)
+  end
+
+  defp handle_execute(:delete_many, coll, [query], opts, s) do
+    flags = []
+    op = op_delete(coll: Utils.namespace(coll, s), query: query, flags: flags)
+    message_gle(-14, op, opts, s)
+  end
+
+  defp handle_execute(:replace_one, coll, [query, replacement], opts, s) do
+    flags  = flags(Keyword.take(opts, @update_flags))
+    op     = op_update(coll: Utils.namespace(coll, s), query: query, update: replacement,
+                       flags: flags)
+    message_gle(-15, op, opts, s)
+  end
+
+  defp handle_execute(:update_one, coll, [query, update], opts, s) do
+    flags  = flags(Keyword.take(opts, @update_flags))
+    op     = op_update(coll: Utils.namespace(coll, s), query: query, update: update,
+                       flags: flags)
+    message_gle(-16, op, opts, s)
+  end
+
+  defp handle_execute(:update_many, coll, [query, update], opts, s) do
+    flags  = [:multi | flags(Keyword.take(opts, @update_flags))]
+    op     = op_update(coll: Utils.namespace(coll, s), query: query, update: update,
+                       flags: flags)
+    message_gle(-17, op, opts, s)
+  end
+
+  defp handle_execute(:command, nil, [query], opts, s) do
+    flags = Keyword.take(opts, @find_one_flags)
+    op_query(coll: Utils.namespace("$cmd", s), query: query, select: "",
+             num_skip: 0, num_return: 1, flags: flags(flags))
+    |> message_reply(s)
+  end
+
+  defp message_reply(op, s) do
+    with {:ok, reply} <- Utils.message(s.request_id, op, s),
+         s = %{s | request_id: s.request_id + 1},
+         do: {:ok, reply, s}
+  end
+
+  defp flags(flags) do
+    Enum.reduce(flags, [], fn
+      {flag, true},   acc -> [flag|acc]
+      {_flag, false}, acc -> acc
     end)
   end
 
-  Enum.each(@update_flags, fn {flag, bit} ->
-    defp flag_to_bit(:update, unquote(flag)), do: unquote(bit)
-  end)
+  defp message_gle(id, op, opts, s) do
+    write_concern = Keyword.take(opts, @write_concern) |> Map.new
+    write_concern = Map.merge(s.write_concern, write_concern)
 
-  Enum.each(@insert_flags, fn {flag, bit} ->
-    defp flag_to_bit(:insert, unquote(flag)), do: unquote(bit)
-  end)
+    if write_concern.w == 0 do
+      with :ok <- Utils.send(id, op, s), do: {:ok, :ok, s}
+    else
+      command = BSON.Encoder.document([{:getLastError, 1}|Map.to_list(write_concern)])
+      gle_op = op_query(coll: Utils.namespace("$cmd", s), query: command,
+                        select: "", num_skip: 0, num_return: -1, flags: [])
 
-  Enum.each(@query_flags, fn {flag, bit} ->
-    defp flag_to_bit(:query, unquote(flag)), do: unquote(bit)
-  end)
+      ops = [{id, op}, {s.request_id, gle_op}]
+      message_reply(ops, s)
+    end
+  end
 
-  Enum.each(@delete_flags, fn {flag, bit} ->
-    defp flag_to_bit(:delete, unquote(flag)), do: unquote(bit)
-  end)
+  def ping(%{wire_version: wire_version, socket: {mod, sock}} = s) do
+    {:ok, active} = getopts(mod, sock, [:active])
+    :ok = setopts(mod, sock, [active: false])
+    with {:ok, %{wire_version: ^wire_version}} <- wire_version(s),
+         :ok = setopts(mod, sock, active),
+         do: {:ok, s}
+  end
 
-  defp flag_to_bit(_op, _flag), do: 0x0
+  defp setopts(:gen_tcp, sock, opts), do: :inet.setopts(sock, opts)
+  defp setopts(:ssl, sock, opts), do: :ssl.setopts(sock, opts)
 
-  defp maybe(nil, _fun), do: ""
-  defp maybe(value, fun), do: fun.(value)
+  defp getopts(:gen_tcp, sock, opts), do: :inet.getopts(sock, opts)
+  defp getopts(:ssl, sock, opts), do: :ssl.getopts(sock, opts)
 end

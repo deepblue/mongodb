@@ -3,6 +3,23 @@ defmodule Mongo do
   The main entry point for doing queries. All functions take a pool to
   run the query on.
 
+  ## Generic options
+
+  All operations take these options.
+
+    * `:timeout` - The maximum time that the caller is allowed the to hold the
+      connection’s state (ignored when using a run/transaction connection,
+      default: `15_000`)
+    * `:pool` - The pooling behaviour module to use, this option is required
+      unless the default `DBConnection.Connection` pool is used
+    * `:pool_timeout` - The maximum time to wait for a reply when making a
+      synchronous call to the pool (default: `5_000`)
+    * `:queue` - Whether to block waiting in an internal queue for the
+      connection's state (boolean, default: `true`)
+    * `:log` - A function to log information about a call, either
+      a 1-arity fun, `{module, function, args}` with `DBConnection.LogEntry.t`
+      prepended to `args` or `nil`. See `DBConnection.LogEntry` (default: `nil`)
+
   ## Read options
 
   All read operations that returns a cursor take the following options
@@ -24,17 +41,15 @@ defmodule Mongo do
       committed to journal - (Default: false)
     * `:wtimeout` - If the write concern is not satisfied in the specified
       interval, the operation returns an error
-
-  ## Logging
-
-  All operations take a boolean `log` option, that determines, whether the
-  pool's `log/5` function will be called.
   """
 
-  alias Mongo.Connection
-  alias Mongo.WriteResult
-  alias Mongo.Pool
+  use Bitwise
+  use Mongo.Messages
+  alias Mongo.Query
 
+  @timeout 5000
+
+  @type conn :: DbConnection.Conn
   @type collection :: String.t
   @opaque cursor :: Mongo.Cursor.t | Mongo.AggregationCursor.t | Mongo.SinglyCursor.t
   @type result(t) :: :ok | {:ok, t} | {:error, Mongo.Error.t}
@@ -50,17 +65,60 @@ defmodule Mongo do
     end
   end
 
-  @doc false
-  def start(_type, _args) do
-    import Supervisor.Spec, warn: false
+  @doc """
+  Start and link to a database connection process.
 
-    children = [
-      worker(Mongo.IdServer, []),
-      worker(Mongo.PBKDF2Cache, [])
-    ]
+  ### Options
 
-    opts = [strategy: :one_for_one, name: Mongo.Supervisor]
-    Supervisor.start_link(children, opts)
+    * `:hostname` - Server hostname
+    * `:port` - Server port
+    * `:database` - Database
+    * `:username` - Username
+    * `:password` - User password
+    * `:auth` - Additionally users to authenticate (list of keyword lists
+      with the keys `:username` and `:password`)
+    * `:auth_source` - Database to authenticate against
+    * `:pool` - The pool module to use, see `DBConnection` for pool dependent
+      options, this option must be included with all requests contacting the
+      pool if not `DBConnection.Connection` (default: `DBConnection.Connection`)
+    * `:idle` - The idle strategy, `:passive` to avoid checkin when idle and
+      `:active` to checkin when idle (default: `:passive`)
+    * `:idle_timeout` - The idle timeout to ping the database (default:
+      `1_000`)
+    * `:backoff_min` - The minimum backoff interval (default: `1_000`)
+    * `:backoff_max` - The maximum backoff interval (default: `30_000`)
+    * `:backoff_type` - The backoff strategy, `:stop` for no backoff and
+      to stop, `:exp` for exponential, `:rand` for random and `:rand_exp` for
+      random exponential (default: `:rand_exp`)
+    * `:after_connect` - A function to run on connect using `run/3`, either
+      a 1-arity fun, `{module, function, args}` with `DBConnection.t` prepended
+      to `args` or `nil` (default: `nil`)
+    * `:ssl` - Set to `true` if ssl should be used (default: `false`)
+    * `:ssl_opts` - A list of ssl options, see the ssl docs
+  """
+  @spec start_link(Keyword.t) :: {:ok, pid} | {:error, Mongo.Error.t | term}
+  def start_link(opts) do
+    DBConnection.start_link(Mongo.Protocol, opts)
+  end
+
+  @doc """
+  Create a supervisor child specification for a pool of connections.
+
+  See `Supervisor.Spec` for child options (`child_opts`).
+
+  See `start_link/1` for connection options (`opts`).
+  """
+  @spec child_spec(Keyword.t, Keyword.t) :: Supervisor.Spec.spec
+  def child_spec(opts, child_opts \\ []) do
+    DBConnection.child_spec(Mongo.Protocol, opts, child_opts)
+  end
+
+  @doc """
+  Generates a new `BSON.ObjectId`.
+  """
+  @spec object_id :: BSON.ObjectId.t
+  def object_id do
+    Mongo.IdServer.new
   end
 
   @doc """
@@ -72,8 +130,8 @@ defmodule Mongo do
     * `:max_time` - Specifies a time limit in milliseconds
     * `:use_cursor` - Use a cursor for a batched response (Default: true)
   """
-  @spec aggregate(Pool.t, collection, [BSON.document], Keyword.t) :: cursor
-  def aggregate(pool, coll, pipeline, opts \\ []) do
+  @spec aggregate(conn, collection, [BSON.document], Keyword.t) :: cursor
+  def aggregate(conn, coll, pipeline, opts \\ []) do
     query = [
       aggregate: coll,
       pipeline: pipeline,
@@ -81,19 +139,126 @@ defmodule Mongo do
       maxTimeMS: opts[:max_time]
     ] |> filter_nils
 
-    cursor? = pool.version >= 1 and Keyword.get(opts, :use_cursor, true)
+    version = Mongo.Monitor.wire_version(conn)
+    cursor? = version >= 1 and Keyword.get(opts, :use_cursor, true)
     cmd = case Keyword.get(opts, :database) do
-      nil -> "$cmd"
-      database -> database <> ".$cmd"
-    end
+            nil -> "$cmd"
+            database -> database <> ".$cmd"
+          end
     opts = Keyword.drop(opts, ~w(allow_disk_use max_time use_cursor database)a)
 
     if cursor? do
       query = query ++ [cursor: filter_nils(%{batchSize: opts[:batch_size]})]
-      aggregation_cursor(pool, cmd, query, nil, opts)
+      aggregation_cursor(conn, cmd, query, nil, opts)
     else
-      singly_cursor(pool, cmd, query, nil, opts)
+      singly_cursor(conn, cmd, query, nil, opts)
     end
+  end
+
+  @doc """
+  Finds a document and updates it (using atomic modifiers).
+
+  ## Options
+
+    * `:bypass_document_validation` -  Allows the write to opt-out of document
+      level validation
+    * `:max_time` -  The maximum amount of time to allow the query to run (in MS)
+    * `:projection` -  Limits the fields to return for all matching documents.
+    * `:return_document` - Returns the replaced or inserted document rather than
+       the original. Values are :before or :after. (default is :before)
+    * `:sort` - Determines which document the operation modifies if the query
+      selects multiple documents.
+    * `:upsert` -  Create a document if no document matches the query or updates
+      the document.
+  """
+  @spec find_one_and_update(conn, collection, BSON.document, BSON.document, Keyword.t) :: result(BSON.document)
+  def find_one_and_update(conn, coll, filter, update, opts \\ []) do
+    modifier_docs(update, :update)
+    query = [
+      findAndModify:            coll,
+      query:                    filter,
+      update:                   update,
+      bypassDocumentValidation: opts[:bypass_document_validation],
+      maxTimeMS:                opts[:max_time],
+      fields:                   opts[:projection],
+      new:                      should_return_new(opts[:return_document]),
+      sort:                     opts[:sort],
+      upsert:                   opts[:upsert],
+      collation:                opts[:collation],
+    ] |> filter_nils
+
+    opts = Keyword.drop(opts, ~w(bypass_document_validation max_time projection return_document sort upsert collation))
+
+    with {:ok, doc} <- command(conn, query, opts), do: {:ok, doc["value"]}
+  end
+
+  @doc """
+  Finds a document and replaces it.
+
+  ## Options
+
+    * `:bypass_document_validation` -  Allows the write to opt-out of document
+      level validation
+    * `:max_time` -  The maximum amount of time to allow the query to run (in MS)
+    * `:projection` -  Limits the fields to return for all matching documents.
+    * `:return_document` - Returns the replaced or inserted document rather than
+      the original. Values are :before or :after. (default is :before)
+    * `:sort` - Determines which document the operation modifies if the query
+      selects multiple documents.
+    * `:upsert` -  Create a document if no document matches the query or updates
+      the document.
+    * `:collation` - Optionally specifies a collation to use in MongoDB 3.4 and
+      higher.
+  """
+  @spec find_one_and_replace(conn, collection, BSON.document, BSON.document, Keyword.t) :: result(BSON.document)
+  def find_one_and_replace(conn, coll, filter, replacement, opts \\ []) do
+    modifier_docs(replacement, :replace)
+    query = [
+      findAndModify:            coll,
+      query:                    filter,
+      update:                   replacement,
+      bypassDocumentValidation: opts[:bypass_document_validation],
+      maxTimeMS:                opts[:max_time],
+      fields:                   opts[:projection],
+      new:                      should_return_new(opts[:return_document]),
+      sort:                     opts[:sort],
+      upsert:                   opts[:upsert],
+      collation:                opts[:collation],
+    ] |> filter_nils
+
+    opts = Keyword.drop(opts, ~w(bypass_document_validation max_time projection return_document sort upsert collation))
+
+    with {:ok, doc} <- command(conn, query, opts), do: {:ok, doc["value"]}
+  end
+
+  defp should_return_new(:after), do: true
+  defp should_return_new(:before), do: false
+  defp should_return_new(_), do: false
+
+  @doc """
+  Finds a document and deletes it.
+
+  ## Options
+
+    * `:max_time` -  The maximum amount of time to allow the query to run (in MS)
+    * `:projection` -  Limits the fields to return for all matching documents.
+    * `:sort` - Determines which document the operation modifies if the query selects multiple documents.
+    * `:collation` - Optionally specifies a collation to use in MongoDB 3.4 and higher.
+  """
+  @spec find_one_and_delete(conn, collection, BSON.document, Keyword.t) :: result(BSON.document)
+  def find_one_and_delete(conn, coll, filter, opts \\ []) do
+    query = [
+      findAndModify: coll,
+      query:         filter,
+      remove:        true,
+      maxTimeMS:     opts[:max_time],
+      fields:        opts[:projection],
+      sort:          opts[:sort],
+      collation:     opts[:collation],
+    ] |> filter_nils
+    opts = Keyword.drop(opts, ~w(max_time projection sort collation))
+
+    with {:ok, doc} <- command(conn, query, opts), do: {:ok, doc["value"]}
   end
 
   @doc """
@@ -105,8 +270,8 @@ defmodule Mongo do
     * `:skip` - Number of documents to skip before returning the first
     * `:hint` - Hint which index to use for the query
   """
-  @spec count(Pool.t, collection, BSON.document, Keyword.t) :: result(non_neg_integer)
-  def count(pool, coll, filter, opts \\ []) do
+  @spec count(conn, collection, BSON.document, Keyword.t) :: result(non_neg_integer)
+  def count(conn, coll, filter, opts \\ []) do
     query = [
       count: coll,
       query: filter,
@@ -118,16 +283,16 @@ defmodule Mongo do
     opts = Keyword.drop(opts, ~w(limit skip hint)a)
 
     # Mongo 2.4 and 2.6 returns a float
-    run_command(pool, query, opts)
-    |> map_result(&(trunc(&1["n"])))
+    with {:ok, doc} <- command(conn, query, opts),
+         do: {:ok, trunc(doc["n"])}
   end
 
   @doc """
   Similar to `count/4` but unwraps the result and raises on error.
   """
-  @spec count!(Pool.t, collection, BSON.document, Keyword.t) :: result!(non_neg_integer)
-  def count!(pool, coll, filter, opts \\ []) do
-    bangify(count(pool, coll, filter, opts))
+  @spec count!(conn, collection, BSON.document, Keyword.t) :: result!(non_neg_integer)
+  def count!(conn, coll, filter, opts \\ []) do
+    bangify(count(conn, coll, filter, opts))
   end
 
   @doc """
@@ -137,8 +302,8 @@ defmodule Mongo do
 
     * `:max_time` - Specifies a time limit in milliseconds
   """
-  @spec distinct(Pool.t, collection, String.t | atom, BSON.document, Keyword.t) :: result([BSON.t])
-  def distinct(pool, coll, field, filter, opts \\ []) do
+  @spec distinct(conn, collection, String.t | atom, BSON.document, Keyword.t) :: result([BSON.t])
+  def distinct(conn, coll, field, filter, opts \\ []) do
     query = [
       distinct: coll,
       key: field,
@@ -148,16 +313,16 @@ defmodule Mongo do
 
     opts = Keyword.drop(opts, ~w(max_time))
 
-    run_command(pool, query, opts)
-    |> map_result(&(&1["values"]))
+    with {:ok, doc} <- command(conn, query, opts),
+         do: {:ok, doc["values"]}
   end
 
   @doc """
   Similar to `distinct/5` but unwraps the result and raises on error.
   """
-  @spec distinct!(Pool.t, collection, String.t | atom, BSON.document, Keyword.t) :: result!([BSON.t])
-  def distinct!(pool, coll, field, filter, opts \\ []) do
-    bangify(distinct(pool, coll, field, filter, opts))
+  @spec distinct!(conn, collection, String.t | atom, BSON.document, Keyword.t) :: result!([BSON.t])
+  def distinct!(conn, coll, field, filter, opts \\ []) do
+    bangify(distinct(conn, coll, field, filter, opts))
   end
 
   @doc """
@@ -178,8 +343,8 @@ defmodule Mongo do
     * `:projection` - Limits the fields to return for all matching document
     * `:skip` - The number of documents to skip before returning (Default: 0)
   """
-  @spec find(Pool.t, collection, BSON.document, Keyword.t) :: cursor
-  def find(pool, coll, filter, opts \\ []) do
+  @spec find(conn, collection, BSON.document, Keyword.t) :: cursor
+  def find(conn, coll, filter, opts \\ []) do
     query = [
       {"$comment", opts[:comment]},
       {"$maxTimeMS", opts[:max_time]},
@@ -202,7 +367,33 @@ defmodule Mongo do
     drop = ~w(comment max_time modifiers sort cursor_type projection cursor_timeout)a
     opts = cursor_type(opts[:cursor_type]) ++ Keyword.drop(opts, drop)
 
-    cursor(pool, coll, query, select, opts)
+    cursor(conn, coll, query, select, opts)
+  end
+
+  @doc false
+  def raw_find(conn, coll, query, select, opts) do
+    params = [query, select]
+    query = %Query{action: :find, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         op_reply(docs: docs, cursor_id: cursor_id, from: from, num: num) = reply,
+         do: {:ok, %{from: from, num: num, cursor_id: cursor_id, docs: docs}}
+  end
+
+  @doc false
+  def get_more(conn, coll, cursor, opts) do
+    query = %Query{action: :get_more, extra: {coll, cursor}}
+    with {:ok, reply} <- DBConnection.execute(conn, query, [], defaults(opts)),
+         :ok <- maybe_failure(reply),
+         op_reply(docs: docs, cursor_id: cursor_id, from: from, num: num) = reply,
+         do: {:ok, %{from: from, num: num, cursor_id: cursor_id, docs: docs}}
+  end
+
+  @doc false
+  def kill_cursors(conn, cursor_ids, opts) do
+    query = %Query{action: :kill_cursors, extra: cursor_ids}
+    with {:ok, :ok} <- DBConnection.execute(conn, query, [], defaults(opts)),
+         do: :ok
   end
 
   @doc """
@@ -210,24 +401,31 @@ defmodule Mongo do
   list for the document because the "command key" has to be the first
   in the document.
   """
-  @spec run_command(Pool.t, BSON.document, Keyword.t) :: result(BSON.document)
-  def run_command(pool, query, opts \\ []) do
-    Pool.run_with_log(pool, :run_command, [query], opts, fn pid ->
-      case Connection.find_one(pid, "$cmd", query, [], opts) do
-        %{"ok" => 1.0} = doc ->
+  @spec command(conn, BSON.document, Keyword.t) :: result(BSON.document)
+  def command(conn, query, opts \\ []) do
+    params = [query]
+    query = %Query{action: :command}
+
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply) do
+      case reply do
+        op_reply(docs: [%{"ok" => 1.0} = doc]) ->
           {:ok, doc}
-        %{"ok" => 0.0, "errmsg" => reason} = error ->
-          {:error, %Mongo.Error{message: "run_command failed: #{reason}", code: error["code"]}}
+        op_reply(docs: [%{"ok" => 0.0, "errmsg" => reason} = error]) ->
+          {:error, %Mongo.Error{message: "command failed: #{reason}", code: error["code"]}}
+        # TODO: Check if needed
+        op_reply(docs: []) ->
+          {:ok, nil}
       end
-    end)
+    end
   end
 
   @doc """
-  Similar to `run_command/3` but unwraps the result and raises on error.
+  Similar to `command/3` but unwraps the result and raises on error.
   """
-  @spec run_command!(Pool.t, BSON.document, Keyword.t) :: result!(BSON.document)
-  def run_command!(pool, query, opts \\ []) do
-    bangify(run_command(pool, query, opts))
+  @spec command!(conn, BSON.document, Keyword.t) :: result!(BSON.document)
+  def command!(conn, query, opts \\ []) do
+    bangify(command(conn, query, opts))
   end
 
   @doc """
@@ -236,24 +434,25 @@ defmodule Mongo do
   If the document is missing the `_id` field or it is `nil`, an ObjectId
   will be generated, inserted into the document, and returned in the result struct.
   """
-  @spec insert_one(Pool.t, collection, BSON.document, Keyword.t) :: result(Mongo.InsertOneResult.t)
-  def insert_one(pool, coll, doc, opts \\ []) do
+  @spec insert_one(conn, collection, BSON.document, Keyword.t) :: result(Mongo.InsertOneResult.t)
+  def insert_one(conn, coll, doc, opts \\ []) do
     assert_single_doc!(doc)
+    {[id], [doc]} = assign_ids([doc])
 
-    Pool.run_with_log(pool, :insert_one, [coll, doc], opts, fn pid ->
-      Connection.insert(pid, coll, doc, opts)
-    end)
-    |> map_result(fn %WriteResult{inserted_ids: ids} ->
-      %Mongo.InsertOneResult{inserted_id: List.first(ids)}
-    end)
+    params = [doc]
+    query = %Query{action: :insert_one, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, _doc} <- get_last_error(reply),
+         do: {:ok, %Mongo.InsertOneResult{inserted_id: id}}
   end
 
   @doc """
   Similar to `insert_one/4` but unwraps the result and raises on error.
   """
-  @spec insert_one!(Pool.t, collection, BSON.document, Keyword.t) :: result!(Mongo.InsertOneResult.t)
-  def insert_one!(pool, coll, doc, opts \\ []) do
-    bangify(insert_one(pool, coll, doc, opts))
+  @spec insert_one!(conn, collection, BSON.document, Keyword.t) :: result!(Mongo.InsertOneResult.t)
+  def insert_one!(conn, coll, doc, opts \\ []) do
+    bangify(insert_one(conn, coll, doc, opts))
   end
 
   @doc """
@@ -269,75 +468,72 @@ defmodule Mongo do
       continue inserting the remaining ones (default: `false`)
   """
   # TODO describe the ordered option
-  @spec insert_many(Pool.t, collection, [BSON.document], Keyword.t) :: result(Mongo.InsertManyResult.t)
-  def insert_many(pool, coll, docs, opts \\ []) do
+  @spec insert_many(conn, collection, [BSON.document], Keyword.t) :: result(Mongo.InsertManyResult.t)
+  def insert_many(conn, coll, docs, opts \\ []) do
     assert_many_docs!(docs)
+    {ids, docs} = assign_ids(docs)
 
     # NOTE: Only for 2.4
     ordered? = Keyword.get(opts, :ordered, true)
-    dbopts = [continue_on_error: not ordered?] ++ opts
+    opts = [continue_on_error: not ordered?] ++ opts
 
-    Pool.run_with_log(pool, :insert_many, [coll, docs], opts, fn pid ->
-      Connection.insert(pid, coll, docs, dbopts)
-    end)
-    |> map_result(fn %WriteResult{inserted_ids: ids, num_inserted: count} ->
-      ids = Enum.with_index(ids) |> Enum.into(%{}, fn {x, y} -> {y, x} end)
-      %Mongo.InsertManyResult{inserted_ids: ids, inserted_count: count}
-    end)
+    params = docs
+    query = %Query{action: :insert_many, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, _doc} <- get_last_error(reply),
+         ids = index_map(ids, 0, %{}),
+         do: {:ok, %Mongo.InsertManyResult{inserted_ids: ids}}
   end
 
   @doc """
   Similar to `insert_many/4` but unwraps the result and raises on error.
   """
-  @spec insert_many!(Pool.t, collection, [BSON.document], Keyword.t) :: result!(Mongo.InsertManyResult.t)
-  def insert_many!(pool, coll, docs, opts \\ []) do
-    bangify(insert_many(pool, coll, docs, opts))
+  @spec insert_many!(conn, collection, [BSON.document], Keyword.t) :: result!(Mongo.InsertManyResult.t)
+  def insert_many!(conn, coll, docs, opts \\ []) do
+    bangify(insert_many(conn, coll, docs, opts))
   end
 
   @doc """
   Remove a document matching the filter from the collection.
   """
-  @spec delete_one(Pool.t, collection, BSON.document, Keyword.t) :: result(Mongo.DeleteResult.t)
-  def delete_one(pool, coll, filter, opts \\ []) do
-    dbopts = [multi: false] ++ opts
-
-    Pool.run_with_log(pool, :delete_one, [coll, filter], opts, fn pid ->
-      Connection.remove(pid, coll, filter, dbopts)
-    end)
-    |> map_result(fn %WriteResult{num_matched: n, num_removed: n} ->
-      %Mongo.DeleteResult{deleted_count: n}
-    end)
+  @spec delete_one(conn, collection, BSON.document, Keyword.t) :: result(Mongo.DeleteResult.t)
+  def delete_one(conn, coll, filter, opts \\ []) do
+    params = [filter]
+    query = %Query{action: :delete_one, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, %{"n" => n}} <- get_last_error(reply),
+         do: {:ok, %Mongo.DeleteResult{deleted_count: n}}
   end
 
   @doc """
   Similar to `delete_one/4` but unwraps the result and raises on error.
   """
-  @spec delete_one!(Pool.t, collection, BSON.document, Keyword.t) :: result!(Mongo.DeleteResult.t)
-  def delete_one!(pool, coll, filter, opts \\ []) do
-    bangify(delete_one(pool, coll, filter, opts))
+  @spec delete_one!(conn, collection, BSON.document, Keyword.t) :: result!(Mongo.DeleteResult.t)
+  def delete_one!(conn, coll, filter, opts \\ []) do
+    bangify(delete_one(conn, coll, filter, opts))
   end
 
   @doc """
   Remove all documents matching the filter from the collection.
   """
-  @spec delete_many(Pool.t, collection, BSON.document, Keyword.t) :: result(Mongo.DeleteResult.t)
-  def delete_many(pool, coll, filter, opts \\ []) do
-    dbopts = [multi: true] ++ opts
-
-    Pool.run_with_log(pool, :delete_many, [coll, filter], opts, fn pid ->
-      Connection.remove(pid, coll, filter, dbopts)
-    end)
-    |> map_result(fn %WriteResult{num_matched: n, num_removed: n} ->
-      %Mongo.DeleteResult{deleted_count: n}
-    end)
-  end
+  @spec delete_many(conn, collection, BSON.document, Keyword.t) :: result(Mongo.DeleteResult.t)
+  def delete_many(conn, coll, filter, opts \\ []) do
+    params = [filter]
+    query = %Query{action: :delete_many, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, %{"n" => n}} <- get_last_error(reply),
+         do: {:ok, %Mongo.DeleteResult{deleted_count: n}}
+end
 
   @doc """
   Similar to `delete_many/4` but unwraps the result and raises on error.
   """
-  @spec delete_many!(Pool.t, collection, BSON.document, Keyword.t) :: result!(Mongo.DeleteResult.t)
-  def delete_many!(pool, coll, filter, opts \\ []) do
-    bangify(delete_many(pool, coll, filter, opts))
+  @spec delete_many!(conn, collection, BSON.document, Keyword.t) :: result!(Mongo.DeleteResult.t)
+  def delete_many!(conn, coll, filter, opts \\ []) do
+    bangify(delete_many(conn, coll, filter, opts))
   end
 
   @doc """
@@ -348,25 +544,30 @@ defmodule Mongo do
     * `:upsert` - if set to `true` creates a new document when no document
       matches the filter (default: `false`)
   """
-  @spec replace_one(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
-  def replace_one(pool, coll, filter, replacement, opts \\ []) do
+  @spec replace_one(conn, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
+  def replace_one(conn, coll, filter, replacement, opts \\ []) do
     modifier_docs(replacement, :replace)
-    dbopts = [multi: false] ++ opts
 
-    Pool.run_with_log(pool, :replace_one, [coll, filter, replacement], opts, fn pid ->
-      Connection.update(pid, coll, filter, replacement, dbopts)
-    end)
-    |> map_result(fn %WriteResult{num_matched: matched, num_modified: modified, upserted_id: id} ->
-      %Mongo.UpdateResult{matched_count: matched, modified_count: modified, upserted_id: id}
-    end)
+    params = [filter, replacement]
+    query = %Query{action: :replace_one, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, doc} <- get_last_error(reply) do
+      case doc do
+        %{"n" => 1, "upserted" => upserted_id} ->
+          {:ok, %Mongo.UpdateResult{matched_count: 0, modified_count: 1, upserted_id: upserted_id}}
+        %{"n" => n} ->
+          {:ok, %Mongo.UpdateResult{matched_count: n, modified_count: n}}
+      end
+    end
   end
 
   @doc """
   Similar to `replace_one/5` but unwraps the result and raises on error.
   """
-  @spec replace_one!(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
-  def replace_one!(pool, coll, filter, replacement, opts \\ []) do
-    bangify(replace_one(pool, coll, filter, replacement, opts))
+  @spec replace_one!(conn, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
+  def replace_one!(conn, coll, filter, replacement, opts \\ []) do
+    bangify(replace_one(conn, coll, filter, replacement, opts))
   end
 
   @doc """
@@ -388,25 +589,30 @@ defmodule Mongo do
     * `:upsert` - if set to `true` creates a new document when no document
       matches the filter (default: `false`)
   """
-  @spec update_one(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
-  def update_one(pool, coll, filter, update, opts \\ []) do
+  @spec update_one(conn, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
+  def update_one(conn, coll, filter, update, opts \\ []) do
     modifier_docs(update, :update)
-    dbopts = [multi: false] ++ opts
 
-    Pool.run_with_log(pool, :update_one, [coll, filter, update], opts, fn pid ->
-      Connection.update(pid, coll, filter, update, dbopts)
-    end)
-    |> map_result(fn %WriteResult{num_matched: matched, num_modified: modified, upserted_id: id} ->
-      %Mongo.UpdateResult{matched_count: matched, modified_count: modified, upserted_id: id}
-    end)
+    params = [filter, update]
+    query = %Query{action: :update_one, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, doc} <- get_last_error(reply) do
+      case doc do
+        %{"n" => 1, "upserted" => upserted_id} ->
+          {:ok, %Mongo.UpdateResult{matched_count: 0, modified_count: 1, upserted_id: upserted_id}}
+        %{"n" => n} ->
+          {:ok, %Mongo.UpdateResult{matched_count: n, modified_count: n}}
+      end
+    end
   end
 
   @doc """
   Similar to `update_one/5` but unwraps the result and raises on error.
   """
-  @spec update_one!(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
-  def update_one!(pool, coll, filter, update, opts \\ []) do
-    bangify(update_one(pool, coll, filter, update, opts))
+  @spec update_one!(conn, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
+  def update_one!(conn, coll, filter, update, opts \\ []) do
+    bangify(update_one(conn, coll, filter, update, opts))
   end
 
   @doc """
@@ -421,181 +627,30 @@ defmodule Mongo do
     * `:upsert` - if set to `true` creates a new document when no document
       matches the filter (default: `false`)
   """
-  @spec update_many(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
-  def update_many(pool, coll, filter, update, opts \\ []) do
+  @spec update_many(conn, collection, BSON.document, BSON.document, Keyword.t) :: result(Mongo.UpdateResult.t)
+  def update_many(conn, coll, filter, update, opts \\ []) do
     modifier_docs(update, :update)
-    dbopts = [multi: true] ++ opts
 
-    Pool.run_with_log(pool, :update_many, [coll, filter, update], opts, fn pid ->
-      Connection.update(pid, coll, filter, update, dbopts)
-    end)
-    |> map_result(fn %WriteResult{num_matched: matched, num_modified: modified, upserted_id: id} ->
-      %Mongo.UpdateResult{matched_count: matched, modified_count: modified, upserted_id: id}
-    end)
+    params = [filter, update]
+    query = %Query{action: :update_many, extra: coll}
+    with {:ok, reply} <- DBConnection.execute(conn, query, params, defaults(opts)),
+         :ok <- maybe_failure(reply),
+         {:ok, doc} <- get_last_error(reply) do
+      case doc do
+        %{"n" => 1, "upserted" => upserted_id} ->
+          {:ok, %Mongo.UpdateResult{matched_count: 0, modified_count: 1, upserted_id: upserted_id}}
+        %{"n" => n} ->
+          {:ok, %Mongo.UpdateResult{matched_count: n, modified_count: n}}
+      end
+    end
   end
 
   @doc """
   Similar to `update_many/5` but unwraps the result and raises on error.
   """
-  @spec update_many!(Pool.t, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
-  def update_many!(pool, coll, filter, update, opts \\ []) do
-    bangify(update_many(pool, coll, filter, update, opts))
-  end
-
-  @doc """
-  Updates an existing document or inserts a new one.
-
-  If the document does not contain the `_id` field, then the `insert_one/3`
-  function is used to persist the document, otherwise `replace_one/5` is used,
-  where the filter is the `_id` field, and the `:upsert` option is set to `true`.
-  """
-  @spec save_one(Pool.t, collection, BSON.document, Keyword.t) :: result(Mongo.SaveOneResult.t)
-  def save_one(pool, coll, doc, opts \\ []) do
-    case get_id(doc) do
-      {:ok, id} ->
-        opts = [upsert: true] ++ opts
-        replace_one(pool, coll, %{_id: id}, doc, opts)
-        |> map_result(fn result ->
-          %Mongo.SaveOneResult{
-            matched_count: result.matched_count,
-            modified_count: result.modified_count,
-            upserted_id: result.upserted_id}
-        end)
-      :error ->
-        insert_one(pool, coll, doc, opts)
-        |> map_result(fn result ->
-          %Mongo.SaveOneResult{
-            matched_count: 0,
-            modified_count: 0,
-            upserted_id: result.inserted_id}
-        end)
-    end
-  end
-
-  @doc """
-  Similar to `save_one/4` but unwraps the result and raises on error.
-  """
-  @spec save_one!(Pool.t, collection, BSON.document, Keyword.t) :: result!(Mongo.SaveOneResult.t)
-  def save_one!(pool, coll, doc, opts \\ []) do
-    bangify(save_one(pool, coll, doc, opts))
-  end
-
-  @doc """
-  Updates documents or inserts them.
-
-  For the documents that does not contain the `_id` field, `insert_many/3`
-  function is used to persist them, for those that do contain the `_id` field,
-  the `replace_one/5` function is invoked for each document separately, where
-  the filter is the `_id` field, and the `:upsert` option is set to `true`.
-
-  ## Options
-
-    * `:ordered` - if set to `false` will group all documents to be inserted
-      together, otherwise it will preserve the order, but it may be slow
-      for large number of documents (default: `false`)
-  """
-  @spec save_many!(Pool.t, collection, BSON.document, Keyword.t) :: result!(Mongo.SaveManyResult.t)
-  def save_many!(pool, coll, docs, opts \\ []) do
-    assert_many_docs!(docs)
-
-    # NOTE: Only for 2.4
-    ordered? = Keyword.get(opts, :ordered, true)
-    opts = [continue_on_error: not ordered?, upsert: true] ++ opts
-    docs = docs_id_ix(docs)
-
-    if ordered? do
-      # Ugh, horribly inefficient
-      save_ordered(pool, coll, docs, opts)
-    else
-      save_unordered(pool, coll, docs, opts)
-    end
-  end
-
-  defp save_ordered(pool, coll, docs, opts) do
-    chunked_docs = Enum.chunk_by(docs, fn {_, id, _} -> id == :error end)
-    result = %Mongo.SaveManyResult{matched_count: 0, modified_count: 0, upserted_ids: %{}}
-
-    Enum.reduce(chunked_docs, result, fn docs, result ->
-      {ix, id, _doc} = hd(docs)
-      if id == :error do
-        save_insert(result, ix, pool, coll, docs, opts)
-      else
-        save_replace(result, ix, pool, coll, docs, opts)
-      end
-    end)
-  end
-
-  defp save_unordered(pool, coll, docs, opts) do
-    docs = Enum.group_by(docs, fn {_, id, _} -> id == :error end)
-    insert_docs  = docs[true] || []
-    replace_docs = docs[false] || []
-
-    %Mongo.SaveManyResult{matched_count: 0, modified_count: 0, upserted_ids: %{}}
-    |> save_insert(0, pool, coll, insert_docs, opts)
-    |> save_replace(length(insert_docs), pool, coll, replace_docs, opts)
-  end
-
-  defp save_insert(result, _ix, _pool, _coll, [], _opts) do
-    result
-  end
-
-  defp save_insert(result, ix, pool, coll, docs, opts) do
-    docs = Enum.map(docs, &elem(&1, 2))
-
-    case insert_many(pool, coll, docs, opts) do
-      :ok ->
-        nil
-      {:ok, insert} ->
-        ids = list_ix(insert.inserted_ids, ix)
-              |> Enum.into(result.upserted_ids)
-        %{result | upserted_ids: ids}
-      {:error, error} ->
-        raise error
-    end
-  end
-
-  defp save_replace(result, ix, pool, coll, docs, opts) do
-    Enum.reduce(docs, {ix, result}, fn {_ix, {:ok, id}, doc}, {ix, result} ->
-      case replace_one(pool, coll, %{_id: id}, doc, opts) do
-        :ok ->
-          {0, nil}
-        {:ok, replace} ->
-          ids =
-            if replace.upserted_id do
-              Map.put(result.upserted_ids, ix, replace.upserted_id)
-              |> Enum.into(result.upserted_ids)
-            else
-              result.upserted_ids
-            end
-
-          result =
-            %{result | matched_count: result.matched_count + replace.matched_count,
-                       modified_count: result.modified_count + replace.modified_count,
-                       upserted_ids: ids}
-          {ix+1, result}
-        {:error, error} ->
-          raise error
-      end
-    end)
-    |> elem(1)
-  end
-
-  defp list_ix(enum, offset) do
-    Enum.map(enum, fn {ix, elem} ->
-      {ix+offset, elem}
-    end)
-  end
-
-  defp map_result(:ok, _fun),                 do: :ok
-  defp map_result({:ok, value}, fun),         do: {:ok, fun.(value)}
-  defp map_result({:error, _} = error, _fun), do: error
-
-  defp docs_id_ix(docs) do
-    Enum.reduce(docs, {0, []}, fn doc, {ix, docs} ->
-      {ix+1, [{ix, get_id(doc), doc} | docs]}
-    end)
-    |> elem(1)
-    |> Enum.reverse
+  @spec update_many!(conn, collection, BSON.document, BSON.document, Keyword.t) :: result!(Mongo.UpdateResult.t)
+  def update_many!(conn, coll, filter, update, opts \\ []) do
+    bangify(update_many(conn, coll, filter, update, opts))
   end
 
   defp modifier_docs([{key, _}|_], type),
@@ -607,12 +662,12 @@ defmodule Mongo do
   defp modifier_docs(list, type) when is_list(list),
     do: Enum.map(list, &modifier_docs(&1, type))
 
-  defp modifier_key(<<?$, _::binary>>, :replace),
-    do: raise(ArgumentError, "replace does not allow atomic modifiers")
+  defp modifier_key(<<?$, _::binary>> = other, :replace),
+    do: raise(ArgumentError, "replace does not allow atomic modifiers, got: #{other}")
   defp modifier_key(<<?$, _::binary>>, :update),
     do: :ok
-  defp modifier_key(<<_, _::binary>>, :update),
-    do: raise(ArgumentError, "update only allows atomic modifiers")
+  defp modifier_key(<<_, _::binary>> = other, :update),
+    do: raise(ArgumentError, "update only allows atomic modifiers, got: #{other}")
   defp modifier_key(_, _),
     do: :ok
 
@@ -621,27 +676,27 @@ defmodule Mongo do
   defp key_to_string(key) when is_binary(key),
     do: key
 
-  defp cursor(pool, coll, query, select, opts) do
+  defp cursor(conn, coll, query, select, opts) do
     %Mongo.Cursor{
-      pool: pool,
+      conn: conn,
       coll: coll,
       query: query,
       select: select,
       opts: opts}
   end
 
-  defp singly_cursor(pool, coll, query, select, opts) do
+  defp singly_cursor(conn, coll, query, select, opts) do
     %Mongo.SinglyCursor{
-      pool: pool,
+      conn: conn,
       coll: coll,
       query: query,
       select: select,
       opts: opts}
   end
 
-  defp aggregation_cursor(pool, coll, query, select, opts) do
+  defp aggregation_cursor(conn, coll, query, select, opts) do
     %Mongo.AggregationCursor{
-      pool: pool,
+      conn: conn,
       coll: coll,
       query: query,
       select: select,
@@ -687,21 +742,6 @@ defmodule Mongo do
   defp cursor_type(:tailable_await),
     do: [tailable_cursor: true, await_data: true]
 
-  defp get_id(doc) do
-    case fetch_value(doc, "_id") do
-      {:ok, id}  -> {:ok, id}
-      :error     -> fetch_value(doc, :_id)
-    end
-  end
-
-  defp fetch_value(doc, key) do
-    case Dict.fetch(doc, key) do
-      {:ok, nil} -> :error
-      {:ok, id}  -> {:ok, id}
-      :error     -> :error
-    end
-  end
-
   defp assert_single_doc!(doc) when is_map(doc), do: :ok
   defp assert_single_doc!([]), do: :ok
   defp assert_single_doc!([{_, _} | _]), do: :ok
@@ -713,4 +753,87 @@ defmodule Mongo do
   defp assert_many_docs!(other) do
     raise ArgumentError, "expected list of documents, got: #{inspect other}"
   end
+
+  defp defaults(opts) do
+    Keyword.put_new(opts, :timeout, @timeout)
+  end
+
+  defp get_last_error(:ok) do
+    :ok
+  end
+  defp get_last_error(op_reply(docs: [%{"ok" => 1.0, "err" => nil} = doc])) do
+    {:ok, doc}
+  end
+  defp get_last_error(op_reply(docs: [%{"ok" => 1.0, "err" => message, "code" => code}])) do
+    # If a batch insert (OP_INSERT) fails some documents may still have been
+    # inserted, but mongo always returns {n: 0}
+    # When we support the 2.6 bulk write API we will get number of inserted
+    # documents and should change the return value to be something like:
+    # {:error, %WriteResult{}, %Error{}}
+    {:error, Mongo.Error.exception(message: message, code: code)}
+  end
+  defp get_last_error(op_reply(docs: [%{"ok" => 0.0, "errmsg" => message, "code" => code}])) do
+    {:error, Mongo.Error.exception(message: message, code: code)}
+  end
+
+  defp assign_ids(doc) when is_map(doc) do
+    [assign_id(doc)]
+    |> Enum.unzip
+  end
+
+  defp assign_ids([{_, _} | _] = doc) do
+    [assign_id(doc)]
+    |> Enum.unzip
+  end
+
+  defp assign_ids(list) when is_list(list) do
+    Enum.map(list, &assign_id/1)
+    |> Enum.unzip
+  end
+  defp assign_id(%{_id: id} = map) when id != nil,
+    do: {id, map}
+  defp assign_id(%{"_id" => id} = map) when id != nil,
+    do: {id, map}
+
+  defp assign_id([{_, _} | _] = keyword) do
+    case Keyword.take(keyword, [:_id, "_id"]) do
+      [{_key, id} | _] when id != nil ->
+        {id, keyword}
+      [] ->
+        add_id(keyword)
+    end
+  end
+
+  defp assign_id(map) when is_map(map) do
+    map |> Map.to_list |> add_id
+  end
+
+  defp add_id(doc) do
+    id = Mongo.IdServer.new
+    {id, add_id(doc, id)}
+  end
+  defp add_id([{key, _}|_] = list, id) when is_atom(key) do
+    [{:_id, id}|list]
+  end
+  defp add_id([{key, _}|_] = list, id) when is_binary(key) do
+    [{"_id", id}|list]
+  end
+  defp add_id([], id) do
+    # Why are you inserting empty documents =(
+    [{"_id", id}]
+  end
+
+  defp index_map([], _ix, map),
+    do: map
+  defp index_map([elem|list], ix, map),
+    do: index_map(list, ix+1, Map.put(map, ix, elem))
+
+  defp maybe_failure(op_reply(flags: flags, docs: [%{"$err" => reason, "code" => code}]))
+    when (@reply_query_failure &&& flags) != 0,
+    do: {:error, Mongo.Error.exception(message: reason, code: code)}
+  defp maybe_failure(op_reply(flags: flags))
+    when (@reply_cursor_not_found &&& flags) != 0,
+    do: {:error, Mongo.Error.exception(message: "cursor not found")}
+  defp maybe_failure(_reply),
+    do: :ok
 end

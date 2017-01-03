@@ -1,41 +1,47 @@
 defmodule Mongodb.Mixfile do
   use Mix.Project
 
+  @version "0.2.1-dev"
+
   def project do
     [app: :mongodb,
-     version: "0.1.2-dev",
-     elixir: "~> 1.0",
-     deps: deps(),
+     version: @version,
+     elixir: "~> 1.2",
      name: "Mongodb",
-     source_url: "https://github.com/ericmj/mongodb",
-     docs: fn ->
-       {ref, 0} = System.cmd("git", ["rev-parse", "--verify", "--quiet", "HEAD"])
-       [source_ref: ref, main: "readme", extras: ["README.md"]]
-     end,
+     deps: deps(),
+     docs: docs(),
      description: description(),
      package: package()]
   end
 
   def application do
-    [applications: [:logger, :connection],
-     mod: {Mongo, []},
+    [applications: [:logger, :connection, :db_connection],
+     mod: {Mongo.App, []},
      env: []]
   end
 
   defp deps do
-    [{:connection, "~> 1.0"},
-     {:poolboy,    "~> 1.5", optional: true},
-     {:ex_doc,     ">= 0.0.0", only: :docs},
-     {:earmark,    ">= 0.0.0", only: :docs}]
+    [{:connection,    "~> 1.0"},
+     {:db_connection, "~> 1.0"},
+     {:poolboy,       ">= 0.0.0", only: :test},
+     {:ex_doc,        ">= 0.0.0", only: :dev},
+     {:earmark,       ">= 0.0.0", only: :dev}]
+  end
+
+  defp docs do
+    [main: "readme",
+     extras: ["README.md"],
+     source_ref: "v#{@version}",
+     source_url: "https://github.com/ericmj/mongodb"]
   end
 
   defp description do
-    "MongoDB driver for Elixir."
+    "MongoDB driver for Elixir"
   end
 
   defp package do
     [maintainers: ["Eric Meadows-Jönsson"],
      licenses: ["Apache 2.0"],
-     links: %{"Github" => "https://github.com/ericmj/mongodb"}]
+     links: %{"GitHub" => "https://github.com/ericmj/mongodb"}]
   end
 end
