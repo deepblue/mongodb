@@ -50,8 +50,8 @@ defmodule Mongo.Protocol do
     end
   end
 
-  def disconnect(opts, %{socket: {:gen_tcp, pid}}) do
-    :gen_tcp.close(pid)
+  def disconnect(_error, %{socket: {:gen_tcp, sock}}) do
+    :gen_tcp.close(sock)
   end
 
   defp maybe_ssl(opts, s) do
